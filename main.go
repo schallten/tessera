@@ -1,28 +1,42 @@
 package main
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/otiai10/gosseract/v2"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
 	_ "slices"
 	"strings"
+	"time"
 )
 
+type dbEntry struct {
+	filename   string
+	fileHash   string
+	content    string
+	checked_at time.Time
+}
+
 // $ pacman -Sy tesseract and then sudo pacman -S tesseract-data-eng
+var db *sql.DB
 
 //var ScreenshotPath = os.Getenv("XDG_PICTURES_DIR") + "/Screenshots"
 
 func initDB() error {
-	db, err := sql.Open("sqlite3", "./index.db")
+	var err error
+	db, err = sql.Open("sqlite3", "./index.db")
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer db.Close()
+	// defer db.Close()
+	db.SetMaxOpenConns(1)
 
 	tableAndCols := `CREATE TABLE IF NOT EXISTS "index" 
 	(
@@ -40,6 +54,39 @@ func initDB() error {
 		return errors.New("lol")
 	}
 	return nil
+}
+
+func putInDB(entry dbEntry) error {
+	query := `INSERT INTO "index" (filename, fileHash, content, checked_at) VALUES (?, ?, ?, ?)`
+
+	//currentTime := time.Now().Format(time.RFC3339)
+
+	_, err := db.Exec(query, entry.filename, entry.fileHash, entry.content, entry.checked_at)
+	if err != nil {
+		log.Printf("Insert failed: %v\n", err)
+		return err
+	}
+
+	return nil
+}
+
+func hashFile(filename string) (string, error) {
+	hasher := sha256.New()
+	file, err := os.Open(filename)
+	if err != nil {
+		fmt.Println(err)
+		return "", errors.New("could not open file for hashing")
+	}
+	defer file.Close()
+	if _, err := io.Copy(hasher, file); err != nil {
+		fmt.Println(err)
+		return "", errors.New("could not copy into hasher")
+	}
+	hashBytes := hasher.Sum(nil)
+	hashString := hex.EncodeToString(hashBytes)
+
+	return hashString, nil
+
 }
 
 func main() {
@@ -71,6 +118,8 @@ func main() {
 	// slice of files
 	var fileNames = make([]string, i)
 	fmt.Println("\nemp:", len(fileNames))
+	var dbEntries = make([]dbEntry, i)
+
 	var k = 0
 	for _, entry := range entries {
 		name := strings.ToLower(entry.Name())
@@ -115,6 +164,16 @@ func main() {
 			fmt.Println("\n No text info found / Could not parse\n")
 		} else {
 			fmt.Println(text)
+			//dbEntries[i].id = i
+			dbEntries[i].filename = path
+			dbEntries[i].fileHash, err = hashFile(path)
+			if err != nil {
+				fmt.Println(err)
+				return
+			}
+			dbEntries[i].content = text
+			dbEntries[i].checked_at = time.Now()
+			putInDB(dbEntries[i])
 		}
 		fmt.Println("=====================\n")
 	}
@@ -123,4 +182,5 @@ func main() {
 	text, _ := client.Text()
 	fmt.Println(text)
 	// Hello, World!
+	defer db.Close()
 }
