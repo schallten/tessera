@@ -42,7 +42,7 @@ func initDB() error {
 	(
 		id integer not null primary key,
 		filename text not null,
-		fileHash varchar(64) not null,
+		fileHash varchar(64) not null unique,
 		content text not null,
 		checked_at text not null
 	);
@@ -57,7 +57,7 @@ func initDB() error {
 }
 
 func putInDB(entry dbEntry) error {
-	query := `INSERT INTO "index" (filename, fileHash, content, checked_at) VALUES (?, ?, ?, ?)`
+	query := `INSERT OR IGNORE INTO "index" (filename, fileHash, content, checked_at) VALUES (?, ?, ?, ?)`
 
 	//currentTime := time.Now().Format(time.RFC3339)
 
@@ -72,7 +72,10 @@ func putInDB(entry dbEntry) error {
 
 func searchDB(term string) error {
 	rows, err := db.Query(
-		`SELECT filename FROM "index" WHERE content LIKE ?`, "%"+term+"%",
+		`SELECT id, filename, fileHash
+         FROM "index"
+         WHERE content LIKE ?`,
+		"%"+term+"%",
 	)
 	if err != nil {
 		return err
@@ -80,15 +83,16 @@ func searchDB(term string) error {
 	defer rows.Close()
 
 	for rows.Next() {
-		var filename string
-		if err := rows.Scan(&filename); err != nil {
+		var id int
+		var filename, fileHash string
+
+		if err := rows.Scan(&id, &filename, &fileHash); err != nil {
 			return err
 		}
-		fmt.Println(filename)
-		if filename != "" {
-			return err
-		}
+
+		fmt.Println(id, filename, fileHash)
 	}
+
 	return rows.Err()
 }
 
@@ -121,7 +125,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println("\n Found these images \n")
+	//	fmt.Println("\n Found these images \n")
 
 	var i = 0
 
@@ -135,11 +139,11 @@ func main() {
 			i = i + 1
 		}
 	}
-	fmt.Printf("\n found %d images ", i)
+	//	fmt.Printf("\n found %d images ", i)
 
 	// slice of files
 	var fileNames = make([]string, i)
-	fmt.Println("\nemp:", len(fileNames))
+	//	fmt.Println("\nemp:", len(fileNames))
 	var dbEntries = make([]dbEntry, i)
 
 	var k = 0
@@ -150,27 +154,27 @@ func main() {
 			strings.HasSuffix(name, ".png") ||
 			strings.HasSuffix(name, ".jpg") {
 
-			fmt.Printf("Name : %s\n", entry.Name())
+			//			fmt.Printf("Name : %s\n", entry.Name())
 			fileNames[k] = entry.Name()
 			k = k + 1
 		}
 	}
 
-	fmt.Println("\n initializing database \n")
+	//	fmt.Println("\n initializing database \n")
 	err = initDB()
 	if err != nil {
 		return
 	}
-	fmt.Println("\n done \n")
+	//	fmt.Println("\n done \n")
 
 	client := gosseract.NewClient()
 	defer client.Close()
-	fmt.Println("\n")
+	//	fmt.Println("\n")
 
 	for i := 0; i < len(fileNames); i++ {
 		path := filepath.Join(ScreenshotPath, fileNames[i])
 
-		fmt.Println("\n===== Testing", path, "=====\n")
+		//		fmt.Println("\n===== Testing", path, "=====\n")
 
 		if err := client.SetImage(path); err != nil {
 			log.Printf("Failed to set image: %v", err)
@@ -183,9 +187,9 @@ func main() {
 			continue
 		}
 		if text == "" {
-			fmt.Println("\n No text info found / Could not parse\n")
+			//			fmt.Println("\n No text info found / Could not parse\n")
 		} else {
-			fmt.Println(text)
+			//			fmt.Println(text)
 			//dbEntries[i].id = i
 			dbEntries[i].filename = path
 			dbEntries[i].fileHash, err = hashFile(path)
@@ -197,12 +201,12 @@ func main() {
 			dbEntries[i].checked_at = time.Now()
 			putInDB(dbEntries[i])
 		}
-		fmt.Println("=====================\n")
+		//		fmt.Println("=====================\n")
 	}
 
 	client.SetImage("assets/test.png")
-	text, _ := client.Text()
-	fmt.Println(text)
+	//	text, _ := client.Text()
+	//	fmt.Println(text)
 	// Hello, World!
 	var term string
 	fmt.Print("Search : ")
