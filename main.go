@@ -70,6 +70,28 @@ func putInDB(entry dbEntry) error {
 	return nil
 }
 
+func searchDB(term string) error {
+	rows, err := db.Query(
+		`SELECT filename FROM "index" WHERE content LIKE ?`, "%"+term+"%",
+	)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var filename string
+		if err := rows.Scan(&filename); err != nil {
+			return err
+		}
+		fmt.Println(filename)
+		if filename != "" {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
 func hashFile(filename string) (string, error) {
 	hasher := sha256.New()
 	file, err := os.Open(filename)
@@ -182,5 +204,12 @@ func main() {
 	text, _ := client.Text()
 	fmt.Println(text)
 	// Hello, World!
+	var term string
+	fmt.Print("Search : ")
+	fmt.Scanln(&term)
+	err = searchDB(term)
+	if err != nil {
+		log.Println(err)
+	}
 	defer db.Close()
 }
