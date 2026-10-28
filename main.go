@@ -26,6 +26,7 @@ type dbEntry struct {
 
 // $ pacman -Sy tesseract and then sudo pacman -S tesseract-data-eng
 var db *sql.DB
+var client *gosseract.Client
 
 //var ScreenshotPath = os.Getenv("XDG_PICTURES_DIR") + "/Screenshots"
 
@@ -115,93 +116,156 @@ func hashFile(filename string) (string, error) {
 
 }
 
+func alreadyScanned(hash string) (bool, error) {
+	var exists bool
+
+	err := db.QueryRow(
+		`SELECT EXISTS(
+            SELECT 1 FROM "index" WHERE fileHash = ?
+        )`,
+		hash,
+	).Scan(&exists)
+
+	return exists, err
+}
+
+type timings struct {
+	hash   time.Duration
+	db     time.Duration
+	ocr    time.Duration
+	insert time.Duration
+}
+
+func isImage(name string) bool {
+	name = strings.ToLower(name)
+	return strings.HasSuffix(name, ".jpeg") ||
+		strings.HasSuffix(name, ".png") ||
+		strings.HasSuffix(name, ".jpg")
+}
+
+func listImages(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	var fileNames []string
+	for _, entry := range entries {
+		if isImage(entry.Name()) {
+			fileNames = append(fileNames, entry.Name())
+		}
+	}
+
+	return fileNames, nil
+}
+
+func processImage(path string, client *gosseract.Client) timings {
+	var t timings
+
+	start := time.Now()
+	fileHash, err := hashFile(path)
+	t.hash = time.Since(start)
+	if err != nil {
+		log.Printf("Hashing failed: %v", err)
+		return t
+	}
+
+	start = time.Now()
+	exists, err := alreadyScanned(fileHash)
+	t.db = time.Since(start)
+	if err != nil {
+		log.Printf("Database lookup failed: %v", err)
+		return t
+	}
+
+	if exists {
+		log.Printf("Skipping already scanned: %s", filepath.Base(path))
+		return t
+	}
+
+	start = time.Now()
+	if err := client.SetImage(path); err != nil {
+		t.ocr = time.Since(start)
+		log.Printf("Failed to set image: %v", err)
+		return t
+	}
+
+	text, err := client.Text()
+	t.ocr = time.Since(start)
+	if err != nil {
+		log.Printf("OCR failed: %v", err)
+		return t
+	}
+
+	entry := dbEntry{
+		filename:   path,
+		fileHash:   fileHash,
+		content:    text,
+		checked_at: time.Now(),
+	}
+
+	start = time.Now()
+	err = putInDB(entry)
+	t.insert = time.Since(start)
+	if err != nil {
+		log.Printf("Database insert failed: %v", err)
+	}
+
+	return t
+}
+
+func refreshIndex(screenshotPath string, client *gosseract.Client) {
+	fileNames, err := listImages(screenshotPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	for _, name := range fileNames {
+		processImage(filepath.Join(screenshotPath, name), client)
+	}
+}
+
+func startPeriodicRefresh(screenshotPath string, client *gosseract.Client) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		log.Println("Refreshing screenshot index...")
+		refreshIndex(screenshotPath, client)
+	}
+}
+
 func main() {
+	var hashTime, dbTime, ocrTime, insertTime time.Duration
 	home, err := os.UserHomeDir()
 	if err != nil {
 		log.Fatal(err)
 	}
 	var ScreenshotPath = home + "/Pictures/Screenshots"
-	entries, err := os.ReadDir(ScreenshotPath)
+	fileNames, err := listImages(ScreenshotPath)
 	if err != nil {
 		log.Fatal(err)
-	}
-	//	fmt.Println("\n Found these images \n")
-
-	var i = 0
-
-	for _, entry := range entries {
-		name := strings.ToLower(entry.Name())
-
-		if strings.HasSuffix(name, ".jpeg") ||
-			strings.HasSuffix(name, ".png") ||
-			strings.HasSuffix(name, ".jpg") {
-
-			i = i + 1
-		}
-	}
-	//	fmt.Printf("\n found %d images ", i)
-
-	// slice of files
-	var fileNames = make([]string, i)
-	//	fmt.Println("\nemp:", len(fileNames))
-	var dbEntries = make([]dbEntry, i)
-
-	var k = 0
-	for _, entry := range entries {
-		name := strings.ToLower(entry.Name())
-
-		if strings.HasSuffix(name, ".jpeg") ||
-			strings.HasSuffix(name, ".png") ||
-			strings.HasSuffix(name, ".jpg") {
-
-			//			fmt.Printf("Name : %s\n", entry.Name())
-			fileNames[k] = entry.Name()
-			k = k + 1
-		}
 	}
 
 	//	fmt.Println("\n initializing database \n")
 	err = initDB()
+
+	client = gosseract.NewClient()
+	go startPeriodicRefresh(ScreenshotPath, client)
+
 	if err != nil {
 		return
 	}
 	//	fmt.Println("\n done \n")
 
-	client := gosseract.NewClient()
-	defer client.Close()
 	//	fmt.Println("\n")
 
-	for i := 0; i < len(fileNames); i++ {
-		path := filepath.Join(ScreenshotPath, fileNames[i])
-
-		//		fmt.Println("\n===== Testing", path, "=====\n")
-
-		if err := client.SetImage(path); err != nil {
-			log.Printf("Failed to set image: %v", err)
-			continue
-		}
-
-		text, err := client.Text()
-		if err != nil {
-			log.Printf("OCR failed: %v", err)
-			continue
-		}
-		if text == "" {
-			//			fmt.Println("\n No text info found / Could not parse\n")
-		} else {
-			//			fmt.Println(text)
-			//dbEntries[i].id = i
-			dbEntries[i].filename = path
-			dbEntries[i].fileHash, err = hashFile(path)
-			if err != nil {
-				fmt.Println(err)
-				return
-			}
-			dbEntries[i].content = text
-			dbEntries[i].checked_at = time.Now()
-			putInDB(dbEntries[i])
-		}
-		//		fmt.Println("=====================\n")
+	for _, name := range fileNames {
+		t := processImage(filepath.Join(ScreenshotPath, name), client)
+		hashTime += t.hash
+		dbTime += t.db
+		ocrTime += t.ocr
+		insertTime += t.insert
 	}
 
 	client.SetImage("assets/test.png")
@@ -209,11 +273,13 @@ func main() {
 	//	fmt.Println(text)
 	// Hello, World!
 	var term string
+	fmt.Printf("hash: %v | db: %v | ocr: %v | insert: %v\n", hashTime, dbTime, ocrTime, insertTime)
 	fmt.Print("Search : ")
 	fmt.Scanln(&term)
 	err = searchDB(term)
 	if err != nil {
 		log.Println(err)
 	}
+	defer client.Close()
 	defer db.Close()
 }

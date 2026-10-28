@@ -34,3 +34,4 @@ go.work.sum
 # testing images
 assets/
 *.db
+tessera
