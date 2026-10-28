@@ -6,15 +6,19 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	_ "github.com/mattn/go-sqlite3"
-	"github.com/otiai10/gosseract/v2"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
-	_ "slices"
 	"strings"
 	"time"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/widget"
+	_ "github.com/mattn/go-sqlite3"
+	"github.com/otiai10/gosseract/v2"
 )
 
 type dbEntry struct {
@@ -24,11 +28,15 @@ type dbEntry struct {
 	checked_at time.Time
 }
 
+type searchHit struct {
+	id       int
+	filename string
+	fileHash string
+}
+
 // $ pacman -Sy tesseract and then sudo pacman -S tesseract-data-eng
 var db *sql.DB
 var client *gosseract.Client
-
-//var ScreenshotPath = os.Getenv("XDG_PICTURES_DIR") + "/Screenshots"
 
 func initDB() error {
 	var err error
@@ -60,8 +68,6 @@ func initDB() error {
 func putInDB(entry dbEntry) error {
 	query := `INSERT OR IGNORE INTO "index" (filename, fileHash, content, checked_at) VALUES (?, ?, ?, ?)`
 
-	//currentTime := time.Now().Format(time.RFC3339)
-
 	_, err := db.Exec(query, entry.filename, entry.fileHash, entry.content, entry.checked_at)
 	if err != nil {
 		log.Printf("Insert failed: %v\n", err)
@@ -71,7 +77,7 @@ func putInDB(entry dbEntry) error {
 	return nil
 }
 
-func searchDB(term string) error {
+func searchDB(term string) ([]searchHit, error) {
 	rows, err := db.Query(
 		`SELECT id, filename, fileHash
          FROM "index"
@@ -79,22 +85,20 @@ func searchDB(term string) error {
 		"%"+term+"%",
 	)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer rows.Close()
 
+	var hits []searchHit
 	for rows.Next() {
-		var id int
-		var filename, fileHash string
-
-		if err := rows.Scan(&id, &filename, &fileHash); err != nil {
-			return err
+		var hit searchHit
+		if err := rows.Scan(&hit.id, &hit.filename, &hit.fileHash); err != nil {
+			return nil, err
 		}
-
-		fmt.Println(id, filename, fileHash)
+		hits = append(hits, hit)
 	}
 
-	return rows.Err()
+	return hits, rows.Err()
 }
 
 func hashFile(filename string) (string, error) {
@@ -113,7 +117,6 @@ func hashFile(filename string) (string, error) {
 	hashString := hex.EncodeToString(hashBytes)
 
 	return hashString, nil
-
 }
 
 func alreadyScanned(hash string) (bool, error) {
@@ -217,7 +220,8 @@ func processImage(path string, client *gosseract.Client) timings {
 func refreshIndex(screenshotPath string, client *gosseract.Client) {
 	fileNames, err := listImages(screenshotPath)
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("Could not read %s: %v", screenshotPath, err)
+		return
 	}
 
 	for _, name := range fileNames {
@@ -225,61 +229,85 @@ func refreshIndex(screenshotPath string, client *gosseract.Client) {
 	}
 }
 
-func startPeriodicRefresh(screenshotPath string, client *gosseract.Client) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		log.Println("Refreshing screenshot index...")
-		refreshIndex(screenshotPath, client)
-	}
-}
-
 func main() {
-	var hashTime, dbTime, ocrTime, insertTime time.Duration
 	home, err := os.UserHomeDir()
 	if err != nil {
 		log.Fatal(err)
 	}
-	var ScreenshotPath = home + "/Pictures/Screenshots"
-	fileNames, err := listImages(ScreenshotPath)
-	if err != nil {
+	screenshotPath := filepath.Join(home, "Pictures", "Screenshots")
+
+	if err := initDB(); err != nil {
 		log.Fatal(err)
 	}
+	defer db.Close()
 
-	//	fmt.Println("\n initializing database \n")
-	err = initDB()
+	log.SetOutput(io.Discard)
+
+	a := app.New()
+	w := a.NewWindow("Tessera")
+	w.Resize(fyne.NewSize(760, 500))
+
+	status := widget.NewLabel("Indexing screenshots...")
+	results := container.NewVBox()
+	resultsScroll := container.NewVScroll(results)
+
+	search := widget.NewEntry()
+	search.SetPlaceHolder("Search screenshot text...")
+
+	doSearch := func(term string) {
+		results.RemoveAll()
+		term = strings.TrimSpace(term)
+		if term == "" {
+			status.SetText("Type something to search.")
+			results.Refresh()
+			return
+		}
+
+		hits, err := searchDB(term)
+		if err != nil {
+			status.SetText("Search failed: " + err.Error())
+			return
+		}
+
+		if len(hits) == 0 {
+			results.Add(widget.NewLabel("No matches."))
+		}
+		for _, hit := range hits {
+			results.Add(widget.NewLabel(fmt.Sprintf("%s  (%s)", hit.filename, hit.fileHash[:8])))
+		}
+		status.SetText(fmt.Sprintf("%d result(s) for %q", len(hits), term))
+		results.Refresh()
+	}
+
+	search.OnSubmitted = doSearch
+	searchBtn := widget.NewButton("Search", func() {
+		doSearch(search.Text)
+	})
+
+	setStatus := func(msg string) {
+		fyne.Do(func() { status.SetText(msg) })
+	}
 
 	client = gosseract.NewClient()
-	go startPeriodicRefresh(ScreenshotPath, client)
+	go func() {
+		defer client.Close()
+		refreshIndex(screenshotPath, client)
+		setStatus("Index up to date.")
 
-	if err != nil {
-		return
-	}
-	//	fmt.Println("\n done \n")
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			setStatus("Refreshing screenshot index...")
+			refreshIndex(screenshotPath, client)
+			setStatus("Index up to date.")
+		}
+	}()
 
-	//	fmt.Println("\n")
-
-	for _, name := range fileNames {
-		t := processImage(filepath.Join(ScreenshotPath, name), client)
-		hashTime += t.hash
-		dbTime += t.db
-		ocrTime += t.ocr
-		insertTime += t.insert
-	}
-
-	client.SetImage("assets/test.png")
-	//	text, _ := client.Text()
-	//	fmt.Println(text)
-	// Hello, World!
-	var term string
-	fmt.Printf("hash: %v | db: %v | ocr: %v | insert: %v\n", hashTime, dbTime, ocrTime, insertTime)
-	fmt.Print("Search : ")
-	fmt.Scanln(&term)
-	err = searchDB(term)
-	if err != nil {
-		log.Println(err)
-	}
-	defer client.Close()
-	defer db.Close()
+	w.SetContent(container.NewBorder(
+		container.NewBorder(nil, nil, nil, searchBtn, search),
+		status,
+		nil, nil,
+		resultsScroll,
+	))
+	w.ShowAndRun()
 }
